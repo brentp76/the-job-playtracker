@@ -16,6 +16,7 @@ import streamlit as st
 # - Player names + score inputs per player count
 # - Unlimited suits selectable (including Authority)
 # - Recommended coverage (ignores Authority by default)
+# - Form resets after submission
 # ============================================================
 
 SUITS = [
@@ -35,12 +36,10 @@ SUITS = [
     "Fence",
 ]
 
-# Recommended suit counts by player count (NOT enforced).
-# Coverage ignores Authority by default.
 RECOMMENDED_SUITS = {2: 3, 3: 4, 4: 6, 5: 6}
 
 MODULES = [
-    "Wagering/Promises",   # core loop, but trackable
+    "Wagering/Promises",
     "Jobs",
     "Heat/Disgrace",
     "Safe",
@@ -49,7 +48,6 @@ MODULES = [
     "Special Suits",
 ]
 
-# Canonical sheet schema we want
 SHEET_TITLE = "Plays"
 SHEET_HEADERS = [
     "timestamp_utc",
@@ -81,19 +79,13 @@ def get_gsheet_client():
 
 
 def ensure_sheet_schema(ws):
-    """
-    Ensures row 1 has all SHEET_HEADERS.
-    If the sheet already exists with fewer columns, we append missing headers.
-    """
     current = ws.row_values(1)
     if not current:
         ws.append_row(SHEET_HEADERS)
         return
 
-    # If headers differ/are missing, extend with missing ones
     missing = [h for h in SHEET_HEADERS if h not in current]
     if missing:
-        # Add missing headers at the end of row 1
         new_headers = current + missing
         ws.update("A1", [new_headers])
 
@@ -134,21 +126,17 @@ def read_plays_df():
     ws = get_sheet()
     rows = ws.get_all_records()
 
-    # Create empty df with expected columns
     if not rows:
         return pd.DataFrame(columns=SHEET_HEADERS)
 
     df = pd.DataFrame(rows)
 
-    # Backfill any missing columns (older rows/sheets)
     for col in SHEET_HEADERS:
         if col not in df.columns:
             df[col] = "" if col.endswith("_json") or col in ["winner", "notes", "timestamp_utc"] else False
 
-    # Normalize types
     df["player_count"] = pd.to_numeric(df["player_count"], errors="coerce").astype("Int64")
 
-    # first_play might be stored as TRUE/FALSE, True/False, or blank
     def to_bool(x):
         if isinstance(x, bool):
             return x
@@ -161,7 +149,7 @@ def read_plays_df():
 
 
 # ----------------------------
-# JSON decode helpers
+# JSON helpers
 # ----------------------------
 def canonical_list(items):
     return sorted([str(x).strip() for x in items if str(x).strip()], key=lambda s: s.lower())
@@ -225,8 +213,6 @@ def compute_coverage(recommended_df: pd.DataFrame, plays_df: pd.DataFrame) -> pd
 
     df = plays_df.copy()
     df["suits_used"] = df["suits_used_json"].apply(decode_json_list).apply(canonical_list)
-
-    # Ignore Authority for coverage matching
     df["suits_used_no_authority"] = df["suits_used"].apply(lambda xs: [x for x in xs if x != "Authority"])
     df["combo_id"] = df.apply(
         lambda r: combo_id(int(r["player_count"]), r["suits_used_no_authority"])
@@ -296,6 +282,10 @@ st.set_page_config(page_title="The Job Playtest Tracker", layout="wide")
 st.title("The Job — Playtest Tracker")
 st.caption("Log plays with any modules and any suit counts (including Authority).")
 
+# Form reset key
+if "form_key" not in st.session_state:
+    st.session_state.form_key = 0
+
 tabs = st.tabs(["Log a Play", "Unplayed (Recommended) Combos", "Stats"])
 
 plays_df = read_plays_df()
@@ -307,60 +297,64 @@ observed_df = compute_observed_combos(plays_df)
 with tabs[0]:
     st.subheader("Log a Play (No Limits)")
 
-    col1, col2, col3 = st.columns(3)
+    with st.form(key=f"log_form_{st.session_state.form_key}", clear_on_submit=True):
+        col1, col2, col3 = st.columns(3)
 
-    with col1:
-        player_count = st.selectbox("Player Count", [2, 3, 4, 5], index=1)
-        rec = RECOMMENDED_SUITS.get(int(player_count))
-        st.caption(f"Recommendation for {player_count} players: **{rec}** suits (not enforced).")
+        with col1:
+            player_count = st.selectbox("Player Count", [2, 3, 4, 5], index=1)
+            rec = RECOMMENDED_SUITS.get(int(player_count))
+            st.caption(f"Recommendation for {player_count} players: **{rec}** suits (not enforced).")
 
-        first_play = st.checkbox("First play? (first time this group played The Job)", value=False)
+            first_play = st.checkbox("First play? (first time this group played The Job)", value=False)
 
-        st.markdown("**Players**")
-        players = []
-        for i in range(int(player_count)):
-            players.append(st.text_input(f"Player {i+1} name", key=f"pname_{i}").strip())
+            st.markdown("**Players**")
+            players = []
+            for i in range(int(player_count)):
+                players.append(st.text_input(f"Player {i+1} name").strip())
 
-        st.markdown("**Scores (Reputation)**")
-        scores = []
-        for i in range(int(player_count)):
-            label = players[i] if players[i] else f"Player {i+1}"
-            scores.append(st.number_input(f"{label} score", value=0, step=1, key=f"pscore_{i}"))
+            st.markdown("**Scores (Reputation)**")
+            scores = []
+            for i in range(int(player_count)):
+                label = players[i] if players[i] else f"Player {i+1}"
+                scores.append(st.number_input(f"{label} score", value=0, step=1))
 
-    with col2:
-        suits_used = st.multiselect("Suits Used (pick any amount)", options=SUITS, default=[])
-        st.caption(f"Selected: **{len(suits_used)}** suits • Density tag: **{density_label(player_count, len(suits_used))}**")
-        st.caption("Authority included." if "Authority" in suits_used else "Authority not included.")
+        with col2:
+            suits_used = st.multiselect("Suits Used (pick any amount)", options=SUITS, default=[])
+            st.caption(f"Selected: **{len(suits_used)}** suits • Density tag: **{density_label(player_count, len(suits_used))}**")
+            st.caption("Authority included." if "Authority" in suits_used else "Authority not included.")
 
-    with col3:
-        modules_on = st.multiselect(
-            "Modules Enabled",
-            options=MODULES,
-            default=["Wagering/Promises", "Jobs", "Heat/Disgrace", "Safe", "Specialists", "Contingencies"],
-        )
+        with col3:
+            modules_on = st.multiselect(
+                "Modules Enabled",
+                options=MODULES,
+                default=["Wagering/Promises", "Jobs", "Heat/Disgrace", "Safe", "Specialists", "Contingencies"],
+            )
+            winner = st.text_input("Winner (optional)")
+            notes = st.text_area("Notes (optional)", height=160)
 
-        winner_options = ["(none)"] + [p for p in players if p]
-        winner_sel = st.selectbox("Winner (optional)", winner_options, index=0)
-        notes = st.text_area("Notes (optional)", height=160)
+        submitted = st.form_submit_button("Submit Play Log")
 
-    if st.button("Submit Play Log", type="primary"):
-        cleaned_players = [p if p else f"Player {i+1}" for i, p in enumerate(players)]
-        cleaned_scores = [int(s) for s in scores]
+        if submitted:
+            cleaned_players = [p if p else f"Player {i+1}" for i, p in enumerate(players)]
+            cleaned_scores = [int(s) for s in scores]
 
-        play = {
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "player_count": int(player_count),
-            "suits_used": canonical_list(suits_used),
-            "modules_on": sorted(modules_on),
-            "first_play": bool(first_play),
-            "players": cleaned_players,
-            "scores": cleaned_scores,
-            "winner": "" if winner_sel == "(none)" else winner_sel,
-            "notes": notes.strip(),
-        }
-        append_play(play)
-        st.success("Logged! Refreshing…")
-        st.rerun()
+            play = {
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "player_count": int(player_count),
+                "suits_used": canonical_list(suits_used),
+                "modules_on": sorted(modules_on),
+                "first_play": bool(first_play),
+                "players": cleaned_players,
+                "scores": cleaned_scores,
+                "winner": winner.strip(),
+                "notes": notes.strip(),
+            }
+            append_play(play)
+            st.success("Logged! Clearing form…")
+
+            # force a new form key so widgets reset even if Streamlit keeps state
+            st.session_state.form_key += 1
+            st.rerun()
 
     st.divider()
     st.subheader("Recent Plays")
