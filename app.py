@@ -1,9 +1,311 @@
+import itertools
+import json
+from datetime import datetime, timezone
+
+import pandas as pd
+import streamlit as st
+
+# ============================================================
+# The Job — Playtest Tracker (Google Sheets persistence)
+# - Unlimited suits selectable (including Authority)
+# - Modules include Jobs + Special Suits
+# - First play checkbox
+# - Player names + per-player scores
+# - Recommended combo coverage (ignores Authority)
+# - Backward compatible sheet schema (auto-add missing columns)
+# - Form clears after submit (clear_on_submit + form_key bump)
+# ============================================================
+
+SUITS = [
+    "Authority",
+    "Tools",
+    "Goods",
+    "Crew",
+    "Access",
+    "Spotlight",
+    "Blackout",
+    "Squeeze",
+    "Clean-Up",
+    "Leverage",
+    "Aftermath",
+    "Fog",
+    "Middlemen",
+    "Fence",
+]
+
+# Not enforced; only for coverage tags + suggested testing.
+RECOMMENDED_SUITS = {2: 3, 3: 4, 4: 6, 5: 6}
+
+MODULES = [
+    "Wagering/Promises",
+    "Jobs",
+    "Heat/Disgrace",
+    "Safe",
+    "Specialists",
+    "Contingencies",
+    "Special Suits",
+]
+
+SHEET_TITLE = "Plays"
+SHEET_HEADERS = [
+    "timestamp_utc",
+    "player_count",
+    "suits_used_json",
+    "modules_on_json",
+    "first_play",
+    "players_json",
+    "scores_json",
+    "winner",
+    "notes",
+]
+
+
+# ----------------------------
+# Google Sheets helpers
+# ----------------------------
+def get_gsheet_client():
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    creds_info = st.secrets["gcp_service_account"]
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+    return gspread.authorize(creds)
+
+
+def ensure_sheet_schema(ws):
+    """Ensure header row contains all SHEET_HEADERS; append any missing headers."""
+    current = ws.row_values(1)
+    if not current:
+        ws.append_row(SHEET_HEADERS)
+        return
+
+    missing = [h for h in SHEET_HEADERS if h not in current]
+    if missing:
+        ws.update("A1", [current + missing])
+
+
+def get_sheet():
+    client = get_gsheet_client()
+    sh = client.open_by_key(st.secrets["SHEET_ID"])
+
+    try:
+        ws = sh.worksheet(SHEET_TITLE)
+    except Exception:
+        ws = sh.add_worksheet(title=SHEET_TITLE, rows=5000, cols=50)
+        ws.append_row(SHEET_HEADERS)
+        return ws
+
+    ensure_sheet_schema(ws)
+    return ws
+
+
+def append_play(play: dict):
+    ws = get_sheet()
+    ws.append_row(
+        [
+            play.get("timestamp_utc", ""),
+            play.get("player_count", ""),
+            json.dumps(play.get("suits_used", []), ensure_ascii=False),
+            json.dumps(play.get("modules_on", []), ensure_ascii=False),
+            bool(play.get("first_play", False)),
+            json.dumps(play.get("players", []), ensure_ascii=False),
+            json.dumps(play.get("scores", []), ensure_ascii=False),
+            play.get("winner", ""),
+            play.get("notes", ""),
+        ]
+    )
+
+
+def read_plays_df():
+    ws = get_sheet()
+    rows = ws.get_all_records()
+
+    if not rows:
+        return pd.DataFrame(columns=SHEET_HEADERS)
+
+    df = pd.DataFrame(rows)
+
+    # Backfill any missing columns for older sheets/rows
+    for col in SHEET_HEADERS:
+        if col not in df.columns:
+            if col in ["first_play"]:
+                df[col] = False
+            else:
+                df[col] = ""
+
+    df["player_count"] = pd.to_numeric(df["player_count"], errors="coerce").astype("Int64")
+
+    def to_bool(x):
+        if isinstance(x, bool):
+            return x
+        s = str(x).strip().lower()
+        return s in ["true", "1", "yes", "y"]
+
+    df["first_play"] = df["first_play"].apply(to_bool)
+
+    return df
+
+
+# ----------------------------
+# JSON helpers
+# ----------------------------
+def canonical_list(items):
+    return sorted([str(x).strip() for x in items if str(x).strip()], key=lambda s: s.lower())
+
+
+def decode_json_list(val):
+    if isinstance(val, list):
+        return val
+    if not isinstance(val, str) or not val.strip():
+        return []
+    try:
+        out = json.loads(val)
+        return out if isinstance(out, list) else []
+    except Exception:
+        return []
+
+
+# ----------------------------
+# Combo + coverage helpers
+# ----------------------------
+def density_label(player_count: int, suit_count: int) -> str:
+    rec = RECOMMENDED_SUITS.get(int(player_count), None)
+    if rec is None:
+        return "Unknown"
+    diff = suit_count - rec
+    if diff == 0:
+        return "Recommended"
+    if diff > 0:
+        return f"Over (+{diff})"
+    return f"Under ({diff})"
+
+
+def combo_id(player_count: int, suits_used: list[str]) -> str:
+    suits_key = "|".join(canonical_list(suits_used))
+    return f"{player_count}P::{suits_key}"
+
+
+def generate_recommended_combos() -> pd.DataFrame:
+    """All recommended combos by player count, excluding Authority from the combination set."""
+    non_authority = [s for s in SUITS if s != "Authority"]
+    rows = []
+    for pc, k in RECOMMENDED_SUITS.items():
+        for suit_set in itertools.combinations(non_authority, k):
+            suits_used = canonical_list(list(suit_set))
+            rows.append(
+                {
+                    "combo_id": combo_id(pc, suits_used),
+                    "player_count": pc,
+                    "suits_used": suits_used,
+                    "recommended_suit_count": k,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def compute_coverage(recommended_df: pd.DataFrame, plays_df: pd.DataFrame) -> pd.DataFrame:
+    """Match played games to recommended combos; ignores Authority when matching."""
+    out = recommended_df.copy()
+    if plays_df.empty:
+        out["played_count"] = 0
+        out["last_played_utc"] = ""
+        return out
+
+    df = plays_df.copy()
+    df["suits_used"] = df["suits_used_json"].apply(decode_json_list).apply(canonical_list)
+
+    df["suits_used_no_authority"] = df["suits_used"].apply(lambda xs: [x for x in xs if x != "Authority"])
+    df["combo_id"] = df.apply(
+        lambda r: combo_id(int(r["player_count"]), r["suits_used_no_authority"])
+        if pd.notna(r["player_count"])
+        else None,
+        axis=1,
+    )
+
+    counts = df.groupby("combo_id").size().rename("played_count")
+    last_play = df.groupby("combo_id")["timestamp_utc"].max().rename("last_played_utc")
+
+    out = out.merge(counts, on="combo_id", how="left").merge(last_play, on="combo_id", how="left")
+    out["played_count"] = out["played_count"].fillna(0).astype(int)
+    out["last_played_utc"] = out["last_played_utc"].fillna("")
+    return out
+
+
+def compute_observed_combos(plays_df: pd.DataFrame) -> pd.DataFrame:
+    """Observed combos as actually played (Authority included if selected)."""
+    if plays_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "combo_id",
+                "player_count",
+                "suits_used",
+                "played_count",
+                "last_played_utc",
+                "suit_count",
+                "density",
+                "has_authority",
+            ]
+        )
+
+    df = plays_df.copy()
+    df["suits_used"] = df["suits_used_json"].apply(decode_json_list).apply(canonical_list)
+    df["suit_count"] = df["suits_used"].apply(len)
+    df["has_authority"] = df["suits_used"].apply(lambda xs: "Authority" in xs)
+    df["density"] = df.apply(
+        lambda r: density_label(int(r["player_count"]), int(r["suit_count"])) if pd.notna(r["player_count"]) else "Unknown",
+        axis=1,
+    )
+    df["combo_id"] = df.apply(
+        lambda r: combo_id(int(r["player_count"]), r["suits_used"])
+        if pd.notna(r["player_count"])
+        else None,
+        axis=1,
+    )
+
+    grp = (
+        df.groupby(["combo_id", "player_count"], dropna=True)
+        .agg(
+            played_count=("combo_id", "size"),
+            last_played_utc=("timestamp_utc", "max"),
+            suits_used=("suits_used", "first"),
+            suit_count=("suit_count", "first"),
+            density=("density", "first"),
+            has_authority=("has_authority", "first"),
+        )
+        .reset_index()
+    )
+    return grp.sort_values(["player_count", "played_count"], ascending=[True, False])
+
+
+# ----------------------------
+# App UI
+# ----------------------------
+st.set_page_config(page_title="The Job Playtest Tracker", layout="wide")
+st.title("The Job — Playtest Tracker")
+st.caption("Log plays with any modules and any suit counts (including Authority).")
+
+# Form reset key
+if "form_key" not in st.session_state:
+    st.session_state.form_key = 0
+
+tabs = st.tabs(["Log a Play", "Unplayed (Recommended) Combos", "Stats"])
+
+plays_df = read_plays_df()
+recommended_df = generate_recommended_combos()
+coverage_df = compute_coverage(recommended_df, plays_df)
+observed_df = compute_observed_combos(plays_df)
+
+# ----------------------------
+# TAB 0: Log a Play
+# ----------------------------
 with tabs[0]:
     st.subheader("Log a Play (No Limits)")
 
-    # Form reset key
-    if "form_key" not in st.session_state:
-        st.session_state.form_key = 0
+    submitted = False  # safety
 
     with st.form(key=f"log_form_{st.session_state.form_key}", clear_on_submit=True):
         col1, col2, col3 = st.columns(3)
@@ -42,10 +344,8 @@ with tabs[0]:
             winner = st.text_input("Winner (optional)")
             notes = st.text_area("Notes (optional)", height=160)
 
-        # ✅ SUBMIT BUTTON MUST BE INSIDE THE FORM BLOCK
         submitted = st.form_submit_button("Submit Play Log")
 
-    # Handle submission OUTSIDE the form block
     if submitted:
         cleaned_players = [p if p else f"Player {i+1}" for i, p in enumerate(players)]
         cleaned_scores = [int(s) for s in scores]
@@ -64,7 +364,7 @@ with tabs[0]:
         append_play(play)
 
         st.success("Logged! Clearing form…")
-        st.session_state.form_key += 1
+        st.session_state.form_key += 1  # forces fresh widget keys
         st.rerun()
 
     st.divider()
@@ -100,3 +400,111 @@ with tabs[0]:
             "notes",
         ]
         st.dataframe(show[cols].tail(25), use_container_width=True)
+
+# ----------------------------
+# TAB 1: Unplayed recommended combos
+# ----------------------------
+with tabs[1]:
+    st.subheader("Unplayed Combos (Recommended suit counts only)")
+    st.caption("Coverage ignores Authority, so Authority-on games can still fill coverage for a recommended suit mix.")
+
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        pc_filter = st.multiselect("Filter Player Count", [2, 3, 4, 5], default=[2, 3, 4, 5])
+    with f2:
+        contains_suit = st.selectbox(
+            "Must Include Suit (optional)",
+            ["(none)"] + [s for s in SUITS if s != "Authority"],
+            index=0,
+        )
+    with f3:
+        show_played_too = st.checkbox("Show played combos too", value=False)
+
+    filtered = coverage_df[coverage_df["player_count"].isin(pc_filter)].copy()
+    if contains_suit != "(none)":
+        filtered = filtered[filtered["suits_used"].apply(lambda xs: contains_suit in xs)]
+    if not show_played_too:
+        filtered = filtered[filtered["played_count"] == 0]
+
+    st.write(f"Combos shown: **{len(filtered)}**")
+
+    if len(filtered) > 0 and not show_played_too:
+        suggestion = filtered.sort_values(["player_count", "combo_id"]).head(1).iloc[0]
+        st.markdown("**Suggested next (recommended) play:**")
+        st.code(f'{suggestion["player_count"]}P | Non-Authority suits: {", ".join(suggestion["suits_used"])}', language="text")
+
+    st.dataframe(
+        filtered[["player_count", "suits_used", "played_count", "last_played_utc", "combo_id"]].sort_values(
+            ["player_count", "played_count", "combo_id"], ascending=[True, True, True]
+        ),
+        use_container_width=True,
+        height=560,
+    )
+
+# ----------------------------
+# TAB 2: Stats
+# ----------------------------
+with tabs[2]:
+    st.subheader("Stats")
+
+    if plays_df.empty:
+        st.info("Log some plays to see stats.")
+    else:
+        df = plays_df.copy()
+        df["suits_used"] = df["suits_used_json"].apply(decode_json_list).apply(canonical_list)
+        df["modules_on"] = df["modules_on_json"].apply(decode_json_list)
+        df["players"] = df["players_json"].apply(decode_json_list)
+        df["scores"] = df["scores_json"].apply(decode_json_list)
+
+        df["suit_count"] = df["suits_used"].apply(len)
+        df["has_authority"] = df["suits_used"].apply(lambda xs: "Authority" in xs)
+        df["density"] = df.apply(
+            lambda r: density_label(int(r["player_count"]), int(r["suit_count"])) if pd.notna(r["player_count"]) else "Unknown",
+            axis=1,
+        )
+
+        colA, colB = st.columns(2)
+
+        with colA:
+            st.markdown("**Suit count distribution**")
+            dist = df.groupby(["player_count", "suit_count"]).size().reset_index(name="plays")
+            st.dataframe(dist.sort_values(["player_count", "suit_count"]), use_container_width=True)
+
+            st.markdown("**First-play rate**")
+            fp = df.groupby("player_count")["first_play"].mean().reset_index()
+            fp["first_play_rate"] = (fp["first_play"] * 100).round(1).astype(str) + "%"
+            st.dataframe(fp[["player_count", "first_play_rate"]], use_container_width=True)
+
+        with colB:
+            st.markdown("**Observed combos (any suit counts, Authority on/off)**")
+            st.dataframe(
+                observed_df[
+                    ["player_count", "suit_count", "density", "has_authority", "suits_used", "played_count", "last_played_utc"]
+                ].head(40),
+                use_container_width=True,
+            )
+
+        st.divider()
+        st.markdown("**Recommended coverage by player count**")
+        cov_pc = coverage_df.groupby("player_count")["played_count"].apply(lambda s: (s > 0).mean()).reset_index()
+        cov_pc.columns = ["player_count", "recommended_coverage_rate"]
+        cov_pc["recommended_coverage_rate"] = (cov_pc["recommended_coverage_rate"] * 100).round(1).astype(str) + "%"
+        st.dataframe(cov_pc, use_container_width=True)
+
+        st.divider()
+        st.markdown("**Suit appearance frequency**")
+        suits_flat = []
+        for xs in df["suits_used"].tolist():
+            suits_flat.extend(xs)
+        freq = pd.Series(suits_flat).value_counts().reset_index()
+        freq.columns = ["suit", "times_used"]
+        st.dataframe(freq, use_container_width=True)
+
+        st.divider()
+        st.markdown("**Module usage frequency**")
+        mods_flat = []
+        for xs in df["modules_on"].tolist():
+            mods_flat.extend(xs)
+        mf = pd.Series(mods_flat).value_counts().reset_index()
+        mf.columns = ["module", "times_used"]
+        st.dataframe(mf, use_container_width=True)
