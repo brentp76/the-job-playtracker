@@ -15,6 +15,8 @@ import streamlit as st
 # - "First play?" checkbox
 # - Player names + score inputs per player count
 # - Unlimited suits selectable (including Authority)
+# - Jobs Version selector (Round Modifiers vs Objective Based)
+# - Stats include Jobs Version frequency + per-player-count breakdown
 # - Recommended coverage (ignores Authority by default)
 # ============================================================
 
@@ -40,13 +42,19 @@ SUITS = [
 RECOMMENDED_SUITS = {2: 3, 3: 4, 4: 6, 5: 6}
 
 MODULES = [
-    "Wagering/Promises",   # core loop, but trackable
+    "Wagering/Promises",  # core loop, but trackable
     "Jobs",
     "Heat/Disgrace",
     "Safe",
     "Specialists",
     "Contingencies",
     "Special Suits",
+]
+
+# Jobs versions to track
+JOBS_VERSIONS = [
+    "Round Modifiers",
+    "Objective Based",
 ]
 
 # Canonical sheet schema we want
@@ -56,6 +64,7 @@ SHEET_HEADERS = [
     "player_count",
     "suits_used_json",
     "modules_on_json",
+    "jobs_version",  # NEW
     "first_play",
     "players_json",
     "scores_json",
@@ -90,10 +99,8 @@ def ensure_sheet_schema(ws):
         ws.append_row(SHEET_HEADERS)
         return
 
-    # If headers differ/are missing, extend with missing ones
     missing = [h for h in SHEET_HEADERS if h not in current]
     if missing:
-        # Add missing headers at the end of row 1
         new_headers = current + missing
         ws.update("A1", [new_headers])
 
@@ -121,6 +128,7 @@ def append_play(play: dict):
             play.get("player_count", ""),
             json.dumps(play.get("suits_used", []), ensure_ascii=False),
             json.dumps(play.get("modules_on", []), ensure_ascii=False),
+            play.get("jobs_version", ""),  # NEW
             bool(play.get("first_play", False)),
             json.dumps(play.get("players", []), ensure_ascii=False),
             json.dumps(play.get("scores", []), ensure_ascii=False),
@@ -134,7 +142,6 @@ def read_plays_df():
     ws = get_sheet()
     rows = ws.get_all_records()
 
-    # Create empty df with expected columns
     if not rows:
         return pd.DataFrame(columns=SHEET_HEADERS)
 
@@ -143,7 +150,12 @@ def read_plays_df():
     # Backfill any missing columns (older rows/sheets)
     for col in SHEET_HEADERS:
         if col not in df.columns:
-            df[col] = "" if col.endswith("_json") or col in ["winner", "notes", "timestamp_utc"] else False
+            if col in ["winner", "notes", "timestamp_utc", "jobs_version"] or col.endswith("_json"):
+                df[col] = ""
+            elif col in ["first_play"]:
+                df[col] = False
+            else:
+                df[col] = ""
 
     # Normalize types
     df["player_count"] = pd.to_numeric(df["player_count"], errors="coerce").astype("Int64")
@@ -156,6 +168,8 @@ def read_plays_df():
         return s in ["true", "1", "yes", "y"]
 
     df["first_play"] = df["first_play"].apply(to_bool)
+
+    df["jobs_version"] = df["jobs_version"].astype(str).fillna("").replace("nan", "")
 
     return df
 
@@ -329,7 +343,9 @@ with tabs[0]:
 
     with col2:
         suits_used = st.multiselect("Suits Used (pick any amount)", options=SUITS, default=[])
-        st.caption(f"Selected: **{len(suits_used)}** suits • Density tag: **{density_label(player_count, len(suits_used))}**")
+        st.caption(
+            f"Selected: **{len(suits_used)}** suits • Density tag: **{density_label(player_count, len(suits_used))}**"
+        )
         st.caption("Authority included." if "Authority" in suits_used else "Authority not included.")
 
     with col3:
@@ -337,6 +353,13 @@ with tabs[0]:
             "Modules Enabled",
             options=MODULES,
             default=["Wagering/Promises", "Jobs", "Heat/Disgrace", "Safe", "Specialists", "Contingencies"],
+        )
+
+        jobs_version = st.selectbox(
+            "Jobs Version Used",
+            ["(none)"] + JOBS_VERSIONS,
+            index=0,
+            help="Track whether the Jobs deck was the Round Modifiers version or the Objective Based version.",
         )
 
         winner_options = ["(none)"] + [p for p in players if p]
@@ -352,6 +375,7 @@ with tabs[0]:
             "player_count": int(player_count),
             "suits_used": canonical_list(suits_used),
             "modules_on": sorted(modules_on),
+            "jobs_version": "" if jobs_version == "(none)" else jobs_version,
             "first_play": bool(first_play),
             "players": cleaned_players,
             "scores": cleaned_scores,
@@ -383,6 +407,7 @@ with tabs[0]:
         cols = [
             "timestamp_utc",
             "player_count",
+            "jobs_version",
             "first_play",
             "suit_count",
             "density",
@@ -405,7 +430,11 @@ with tabs[1]:
     with f1:
         pc_filter = st.multiselect("Filter Player Count", [2, 3, 4, 5], default=[2, 3, 4, 5])
     with f2:
-        contains_suit = st.selectbox("Must Include Suit (optional)", ["(none)"] + [s for s in SUITS if s != "Authority"], index=0)
+        contains_suit = st.selectbox(
+            "Must Include Suit (optional)",
+            ["(none)"] + [s for s in SUITS if s != "Authority"],
+            index=0,
+        )
     with f3:
         show_played_too = st.checkbox("Show played combos too", value=False)
 
@@ -420,7 +449,10 @@ with tabs[1]:
     if len(filtered) > 0 and not show_played_too:
         suggestion = filtered.sort_values(["player_count", "combo_id"]).head(1).iloc[0]
         st.markdown("**Suggested next (recommended) play:**")
-        st.code(f'{suggestion["player_count"]}P | Non-Authority suits: {", ".join(suggestion["suits_used"])}', language="text")
+        st.code(
+            f'{suggestion["player_count"]}P | Non-Authority suits: {", ".join(suggestion["suits_used"])}',
+            language="text",
+        )
 
     st.dataframe(
         filtered[["player_count", "suits_used", "played_count", "last_played_utc", "combo_id"]].sort_values(
@@ -449,6 +481,10 @@ with tabs[2]:
             axis=1,
         )
 
+        # Normalize jobs_version for display
+        df["jobs_version"] = df.get("jobs_version", "").astype(str).fillna("").replace("nan", "")
+        df["jobs_version"] = df["jobs_version"].apply(lambda x: x if x.strip() else "(unspecified)")
+
         colA, colB = st.columns(2)
 
         with colA:
@@ -460,6 +496,20 @@ with tabs[2]:
             fp = df.groupby("player_count")["first_play"].mean().reset_index()
             fp["first_play_rate"] = (fp["first_play"] * 100).round(1).astype(str) + "%"
             st.dataframe(fp[["player_count", "first_play_rate"]], use_container_width=True)
+
+            st.markdown("**Jobs Version usage**")
+            jv = df["jobs_version"].value_counts().reset_index()
+            jv.columns = ["jobs_version", "plays"]
+            st.dataframe(jv, use_container_width=True)
+
+            st.markdown("**Jobs Version by player count**")
+            jv_pc = (
+                df.groupby(["player_count", "jobs_version"])
+                .size()
+                .reset_index(name="plays")
+                .sort_values(["player_count", "plays"], ascending=[True, False])
+            )
+            st.dataframe(jv_pc, use_container_width=True)
 
         with colB:
             st.markdown("**Observed combos (any suit counts, Authority on/off)**")
