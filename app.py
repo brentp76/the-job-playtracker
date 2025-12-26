@@ -43,8 +43,35 @@ MODULES = [
     "Safe",
     "Specialists",
     "Contingencies",
-    "Special Suits",
 ]
+# =========================
+# Page + Tabs (MUST be before any `with tabs[...]`)
+# =========================
+
+st.set_page_config(
+    page_title="The Job Playtest Tracker",
+    layout="wide",
+)
+
+st.title("The Job — Playtest Tracker")
+st.caption(
+    "Log playtests with any suits, any modules, and track which combinations have not been tested yet."
+)
+
+# Used to force-clear the form after submission
+if "form_key" not in st.session_state:
+    st.session_state.form_key = 0
+
+# Create tabs ONCE
+tabs = st.tabs(
+    [
+        "Log a Play",
+        "Unplayed Combos",
+        "Stats",
+    ]
+)
+
+
 
 SHEET_TITLE = "Plays"
 SHEET_HEADERS = [
